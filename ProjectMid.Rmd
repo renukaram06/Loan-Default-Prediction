@@ -1,0 +1,443 @@
+---
+title: "Mid Project Report"
+author: "Renuka Ramachandran"
+date: "13 November 2017"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading required libraries
+
+```{r lib}
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(caret)
+library(readr)
+library(DT)
+library(rgdal)
+library(choroplethrMaps)
+library(choroplethr)
+library(corrplot)
+library(rpart)
+library(kernlab)
+```
+
+## Data Preparation
+
+**Load the data**
+```{r load}
+loan_data <- read_csv("C:/Users/Renuka/Desktop/coursework/AdvStats/Project/LoanStats3a.csv")
+dim(loan_data)
+```
+*Removing columns with no data*
+```{r rmcol, echo = FALSE}
+loan_data <- Filter(function(x)!all(is.na(x)), loan_data)
+dim(loan_data)
+```
+
+*Removing columns which consist of only one value and other columns with repetitive data*
+```{r remove}
+loan_data <- loan_data %>%
+              select(-c(funded_amnt, funded_amnt_inv, grade, sub_grade, emp_title,
+                        verification_status, pymnt_plan,title, zip_code, earliest_cr_line, revol_bal,
+                        initial_list_status, out_prncp,out_prncp_inv, recoveries,
+                        collection_recovery_fee, last_pymnt_amnt, total_pymnt_inv, application_type,
+                        collections_12_mths_ex_med, policy_code, delinq_amnt, hardship_flag,
+                        acc_now_delinq, chargeoff_within_12_mths, debt_settlement_flag, disbursement_method, tax_liens))
+
+dim(loan_data)
+```
+
+*Percentage of Missing values in each column*
+```{r miss}
+percent_missing <- round(colMeans(is.na(loan_data))*100,2)
+percent_missing
+```
+
+*Remove columns with missing values greater than 50%*
+```{r rm_miss}
+loan_data <- loan_data %>%
+             select(-c(debt_settlement_flag_date, settlement_status,settlement_date,settlement_amount,
+                    settlement_percentage, settlement_term, next_pymnt_d, mths_since_last_delinq,desc,
+                    mths_since_last_record))
+dim(loan_data)
+```
+*Number of rows with missing values*
+```{r missing}
+nrows <- sum(!complete.cases(loan_data)) 
+nrows
+```
+*Removing rows with missing data ~3% of the data*
+```{r completecases}
+loan_data <- loan_data[complete.cases(loan_data), ]
+dim(loan_data)
+```
+
+*Structure of the data*
+```{r str}
+str(loan_data)
+```
+
+#Changing data type of columns 
+```{r dt}
+loan_data$int_rate <- as.numeric(gsub("%","",loan_data$int_rate))
+loan_data$revol_util <- as.numeric(gsub("%","",loan_data$revol_util))
+
+```
+
+#Exploring Loan Status 
+```{r loanstatus}
+table(loan_data$loan_status)
+```
+
+*Removing loans which do not meet credit policy to avoid ambiguity* - removed all the records that did not meet credit thresholds since these loans were not endorsed by Lending Club, and so are less important.
+```{r clean}
+loan_data <- filter(loan_data, !grepl('Does not meet the credit policy.',loan_status))
+table(loan_data$loan_status)
+```
+
+##Exploratory Data Analysis
+
+#Exploring categorical variables
+Frequency statistics of the different categorical variables. 
+
+```{r eda3}
+# Checking column types to see if they are categorical or contiunous
+all_vars <- unlist(lapply(loan_data,class))
+
+# Extracting categorical variables
+remove <- c("issue_d","addr_state","last_pymnt_d","last_credit_pull_d")
+loan_data_ref <- loan_data[,!(names(loan_data) %in% remove)]
+cat_vars <- unlist(lapply(loan_data_ref,class))
+cat_info <- lapply(1:sum(cat_vars == "character"), function(inx) {
+  Category <- loan_data[,names(cat_vars[cat_vars == "character"])[inx]]
+  # Getting frequency counts and sorting in decreasing order
+  counts_df <- data.frame(table(Category)) %>% arrange(desc(Freq))
+  counts_df$Category <- as.character(counts_df$Category)
+  dfs <- data.frame(Name = names(cat_vars[cat_vars == "character"])[inx],
+                   counts_df, stringsAsFactors = F)
+  dfs$`Freq %` <- round(100*dfs$Freq/sum(dfs$Freq))
+  dfs
+}) %>% bind_rows()
+
+# Formatting into interactive HTML table
+datatable(cat_info)
+```
+
+**Inferences:**
+1. Most of the borrowers almost 92% are do not own homes, they are under rent or mortgage. 
+2. Higher number of loans are issued for a 30 month term than a 60 month term.
+3. The number of 'Charged Off' loans are way lower when compared to 'Fully Paid' loans, thus 
+we will need to oversample the data in order to balance the dataset.
+
+*Relationship between Loan Status and Purpose of Loan*
+
+```{r eda4}
+tab <- table(loan_data$loan_status,loan_data$purpose)
+# Uses column margin (proportion); margin=1 uses row margins (proportion). 
+tab1<-prop.table(tab, margin=1) 
+tab1
+barplot(tab1, col=c("coral", "greenyellow"), main="Loan Status For Different Purpose") 
+legend("right", 
+    legend = c("Charged Off","Fully Paid"), 
+    fill = c("coral", "greenyellow"))	  
+```
+
+**Inference:**
+- From the charts above it can be seen that majority of the loans are taken to tackle 'debt_consolidation' of which almost half of the borrowers have defaulted.
+
+*Relationship between Loan Status and Employment Duration of the borrower*
+```{r eda5}
+tab <- table(loan_data$loan_status,loan_data$emp_length)
+# Uses column margin (proportion); margin=1 uses row margins (proportion). 
+tab1<-prop.table(tab, margin=1) 
+tab1
+barplot(tab1, col=c("darkblue", "greenyellow"), main="Loan Status For Different Employment Lengths") 
+legend("topright", 
+    legend = c("Charged Off","Fully Paid"), 
+    fill = c("darkblue", "greenyellow"))	 
+
+```
+
+**Inferences** 
+1. Maximum number of borrowers have an employment length of more than 10+ years
+2. It can be noticed that there are quite a number of borrowers having < 1 year employment duration
+
+
+*Total Loan Amount Volumes by State - to understand in which states the borrowers live in:*
+
+```{r eda6}
+# Aggregating up by state
+loan_by_state <- loan_data %>% 
+                 group_by(addr_state) %>%
+                 summarize(`Total Loans ($)` = sum(loan_amnt)/1e6) %>%
+                 arrange(desc(`Total Loans ($)`))
+colnames(loan_by_state) <- c("region","value")
+# Getting summary percentage of top 4 regions
+top4_states <- round(100*sum(loan_by_state$value[1:4])/sum(loan_by_state$value),1)
+# Replacing out the state codes with their full names for plotting
+data("state.regions")
+loan_by_state$region <- sapply(loan_by_state$region, function(state_code) {
+    inx <- grep(pattern = state_code, x = state.regions$abb)
+    state.regions$region[inx]
+})
+# Plotting US map with values
+state_choropleth(loan_by_state, title = "           Total Loan Volume by State - Millions $")
+```
+**Inference:**
+- More number of borrowers live in the states of California, Texas, Florida, Pennsylvania, New York and Illinois. This can be attributed to the fact that the population in these states are high compared to the rest of the country. 
+
+#Exploring numerical variables
+
+**Summary Statistics of numerical variables**
+```{r eda0}
+# Enters zero NAs for summary when there are none so the summary data structures can be combined
+custom_summary <- function(var) {
+    res <- summary(var)
+    return(res)
+}
+# Extracting continuous variables
+cont_info <- lapply(loan_data[,all_vars == "numeric"], custom_summary) 
+
+# Formatting summaries into uniform data structure and combining
+cont_names <- names(all_vars[all_vars == "numeric"])
+cont_info <- lapply(1:length(cont_info), function(inx) {
+  new_vect <- c(cont_names[inx],round(cont_info[[inx]],2))
+  names(new_vect)[1] <- "Var Name"
+  new_vect
+}); 
+cont_info <- do.call(rbind,cont_info)
+
+
+# Formatting into interactive HTML table
+datatable(cont_info)
+```
+
+**Observation:**
+- The total_rec_late_fee has value 0 most of the cases and will not be useful in the analysis
+
+#Debt to Income Ratio Distribution
+```{r eda1}
+dti_raw <- loan_data$dti
+dens1 <- qplot(dti_raw, fill = I("dodgerblue4"), 
+               alpha = I(0.4), col = I("grey29")) + xlab("dti full range") + ylab("Count")
+dens1
+
+p <-loan_data[loan_data$loan_status=="Fully Paid",]
+d <-loan_data[loan_data$loan_status=="Charged Off",]
+plot(density(p$dti), col="green", lwd=2.5, main="Distribution of Debt-to-Income by Loan Status")
+lines(density(d$dti), col="red", lwd=2.5)
+legend("right", legend = c("Fully Paid", "Charged Off"), fill = c("green","red"))
+```
+***Inference***
+- Debt to Income ratio is almost normally distributed
+- The distribution of debt_to_income ratio is very similar for 'Fully Paid' and 'Charged Off' loans
+
+
+#Interest Rate Distribution by Loan Status
+```{r eda2}
+p <-loan_data[loan_data$loan_status=="Fully Paid",]
+d <-loan_data[loan_data$loan_status=="Charged Off",]
+plot(density(p$int_rate), col="blue", lwd=2.5, main="Distribution of Interest Rate by Loan Status")
+lines(density(d$int_rate), col="red", lwd=2.5)
+legend("right", legend = c("Fully Paid", "Charged Off"), fill = c("blue","red"))	
+```
+
+***Inference:***
+Interest Rate is right skewed in the case of 'Fully Paid' loans whereas it is more spread for the Charged Off loans. This means that more number of 'Fully Paid' have lower interest rate compared to
+'Charged Off' loans.
+
+#Loan Amount Distribution by Loan Status 
+```{r eda10}
+p <-loan_data[loan_data$loan_status=="Fully Paid",]
+d <-loan_data[loan_data$loan_status=="Charged Off",]
+plot(density(p$loan_amnt), col="blue", lwd=2.5, main="Distribution of Loan by Loan Status")
+lines(density(d$loan_amnt), col="orange", lwd=2.5)
+legend("right", legend = c("Fully Paid", "Charged Off"), fill = c("blue","orange"))	
+```
+**Inference:**
+- It can be observed that higher number of loans have been issued for smaller loan amounts, thus the distribution is skewed. Also, the distribution dont vary a lot between 'Fully Paid' and 'Charged Off' loans 
+
+##Additional Metrics
+```{r met}
+#Creating additional metric from the data that can affect the loan status
+#openacc_ratio = total number of open credit lines/total number of credit lines
+#This can assess the financial strength of the borrower, as in how much debt borrower has.
+loan_data$openacc_ratio <- (loan_data$open_acc/loan_data$total_acc)*100
+
+loan_data <- loan_data %>%
+             select(loan_status,loan_amnt,int_rate,installment,emp_length,home_ownership,
+                    annual_inc,purpose,dti,openacc_ratio)
+```
+
+##Overall Correlation between Numeric Variables
+```{r corr}
+loan_data_num <- loan_data %>%
+                  select(loan_amnt,int_rate,installment,annual_inc,dti,openacc_ratio)
+cormat <- cor(loan_data_num)
+round(cormat, 2) # Rounded to 2 decimals
+corrplot(cormat, method="circle", addCoef.col="black")
+
+```
+
+**Observation:**
+- From the correlation matrix we can identify that loan_amnt and installment has very high correlation, this is natural. Hence we need not consider installment separately as a predictor when we build the model since its effect is already captured by 'loan_amnt'.
+
+##Feature Engineering 
+
+Merging categories of the factors - keeping top five buckets as such and combining the rest into 
+one category 'Others'
+
+```{r fe}
+table(loan_data$emp_length)
+#Re-bucketing emp_length variable as:
+#10+ years, < 1 year , 2-5 years, 6-9 years based on frequency shown below
+loan_data_mod <- loan_data 
+loan_data_mod <- loan_data[,-4]
+loan_data_mod$emp_length <- gsub("[2-5] years","2-5 years",loan_data_mod$emp_length)
+loan_data_mod$emp_length <- gsub("[6-9] years","6-9 years",loan_data_mod$emp_length)
+loan_data_mod <- loan_data_mod%>%
+                  filter(emp_length!='n/a')
+```
+```{r bucket}
+#Re-bucketing Purpose variable based on frequency as 
+#debt_consolidation,credit_card,home_improvement,major_purchase,small_business,other
+table(loan_data_mod$purpose)
+loan_data_mod$purpose <- gsub("car","other",gsub("educational","other",gsub("house","other",gsub("medical","other",gsub("moving","other",gsub("renewable_energy","other",gsub("vacation","other",gsub("wedding","other",loan_data_mod$purpose))))))))
+```
+
+
+##Model Building
+
+#Decision Tree
+Implemented decision trees first because it implicitly perform variable screening or feature selection for the given data, this wil help me identify important variables in the initial stages itself. Also, it handles categorical variables as such and it is easily interpretable.
+
+```{r mod2}
+#Creating train and test dataset
+#Balancing dataset to have enough Good and Bad loan observations
+
+loan_data_1 <- loan_data_mod %>%
+                  filter(loan_status=="Charged Off")
+loan_data_0 <- loan_data_mod %>%
+                  filter(loan_status=="Fully Paid")
+loan_data_bal <- rbind(loan_data_1,loan_data_0[c(1:5250),])
+
+set.seed(1)
+train_rows <- sample(nrow(loan_data_bal), 0.7*nrow(loan_data_bal))
+train_dt <- loan_data_bal[train_rows,]
+test_dt <- loan_data_bal[-c(train_rows),]
+#Creating Decision tree
+loan_dtree <- rpart(loan_status ~ ., data = train_dt, control=rpart.control(minsplit=10, minbucket=3))
+plot(loan_dtree)
+text(loan_dtree, pretty = 0, cex = 1)
+
+summary(loan_dtree)
+
+```
+
+**Model Evaluation**
+
+```{r mod2_acc}
+predictions_dt <- (predict(loan_dtree, test_dt, type = "class"))
+confusionMatrix(predictions_dt, test_dt$loan_status)
+
+```
+
+**Inferences**:
+
+1. Interest_rate seems to be the most important variable which is used throught various levels of the tree, this can be seen in the tree diagram.
+2. Other important variables as indicated in the summary include purpose, annual_inc, openacc_ratio and loan_amnt.
+3. The minsplit=10, minbucket=3 was set because that gave the best accuracy. Tuning of these parameters was done on a trial and error basis.
+4. The reusulting accuracy of the model is 75.6%
+
+
+
+#Logistic Regression
+
+On using logistic regression, I will be further able to understand the impact the various predictors on the dependent variables. Apart from knowing just the important variables, I can now understand whether there is a positive or negative reationship between the predictors and the dependent variable.
+To build this modeld On-Hot encoding is carried out on the categorical variables.
+
+```{r bal}
+#Categorizing loan_status to be 1 as Charged Off/Default and 0 as Fully Paid/Non-Default
+loan_data_mod$loan_status_cat <- ifelse(loan_data_mod$loan_status=='Charged Off',1,0)
+
+#One Hot-encoding
+loan_data_final <- cbind(loan_data_mod, model.matrix(~emp_length-1,loan_data_mod), model.matrix(~home_ownership-1,loan_data_mod), model.matrix(~purpose-1,loan_data_mod))
+
+remove <- c("loan_status","emp_length","home_ownership","purpose")
+loan_data_final <- loan_data_final[,!(names(loan_data_final) %in% remove)]
+
+#Creating train and test dataset
+#Balancing dataset to have enough Good and Bad loan observations
+
+loan_data_1 <- loan_data_final %>%
+                  filter(loan_status_cat==1)
+loan_data_0 <- loan_data_final %>%
+                  filter(loan_status_cat==0)
+loan_data_bal <- rbind(loan_data_1, loan_data_0[c(1:5250),])
+set.seed(1)
+train_rows <- sample(nrow(loan_data_bal), 0.7*nrow(loan_data_bal))
+train <- loan_data_bal[train_rows, ]
+test <- loan_data_bal[-c(train_rows),]
+
+```
+
+**Model**
+```{r mod1}
+fit_model1 <- glm(loan_status_cat ~ ., data = train, family = binomial)
+summary(fit_model1)
+```
+
+**Model Evaluation**
+```{r mod1_acc}
+p <- predict(fit_model1, test, type = "response")
+p_model <- ifelse(p > 0.5, "1", "0")
+t <- table(p_model, test$loan_status_cat)
+t
+accuracy <- (980+992)/sum(t)
+accuracy
+error_rate <- 1-accuracy
+```
+
+**Inferences**:
+1. From the summary it can be observed that the most significant variables are loan amount, interest rate, annual_income and purpose of loan.
+2.The model gives a slightly lower accuracy of 62.6% when compared to decision tree method.
+
+#Support Vector Machines - SVM
+Random Forest was also experimented with, but the results were very poor. Random forest is intrinsically suited for multiclass problems, while SVM is intrinsically two-class. SVM is the third model I chose to implement.
+
+```{r mod3}
+svm_model <- ksvm(loan_status ~ .,
+                 data = train_dt,
+                 kernel = "rbfdot",
+                 kpar = list(sigma=0.003909534),
+                 C = 0.1,
+                 prob.model = TRUE,
+                 scaled = FALSE)
+
+summary(svm_model)
+
+```
+
+
+**Model Evaluation**
+```{r mod3_acc}
+predict_loan_status_svm <- predict(svm_model,test_dt,type="probabilities")
+predict_loan_status_svm <- as.data.frame(predict_loan_status_svm)$"Fully Paid"
+predict_loan_status_label <- ifelse(predict_loan_status_svm < 0.5,"Charged Off","Fully Paid")
+c <- confusionMatrix(predict_loan_status_label,test_dt$loan_status,positive = "Fully Paid")
+c
+```
+
+**Inferences**:
+1. Since the given dataset does not have a lot of variables, SVM is not a very apt method. It is more suited when working with dataset of high demiensionality. 
+2. SVM resulted in the least accuracy with 51.9%.
+
+##Model Comparison and Final Results
+
+1. As per the analysis conducted the factors that we need to look out for to detect default loan cases are interest_rate, loan_amount, purpose and annual income
+2. The best accuracy was obtained for decision trees model compared to logistic and SVM with 75% accuracy.
+
